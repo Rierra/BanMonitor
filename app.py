@@ -39,6 +39,7 @@ class RedditBanMonitor:
         self.session = None
         self.monitoring_task = None
         self.application = None
+        self.shutdown_event = asyncio.Event()
         
         # Validate required environment variables
         self._validate_config()
@@ -57,48 +58,58 @@ class RedditBanMonitor:
     
     async def initialize(self):
         """Initialize the bot components"""
-        self.session = aiohttp.ClientSession()
-        
-        # Get Reddit OAuth token
-        await self._get_reddit_token()
-        
-        # Initialize Telegram bot application
-        self.application = Application.builder().token(self.bot_token).build()
-        
-        # Add command handlers
-        self.application.add_handler(CommandHandler("start", self._start_command))
-        self.application.add_handler(CommandHandler("add", self._add_user_command))
-        self.application.add_handler(CommandHandler("remove", self._remove_user_command))
-        self.application.add_handler(CommandHandler("list", self._list_users_command))
-        self.application.add_handler(CommandHandler("status", self._status_command))
-        
-        # Initialize the application
-        await self.application.initialize()
-        
-        logger.info("Bot initialized successfully")
+        try:
+            self.session = aiohttp.ClientSession()
+            
+            # Get Reddit OAuth token
+            await self._get_reddit_token()
+            
+            # Initialize Telegram bot application
+            self.application = Application.builder().token(self.bot_token).build()
+            
+            # Add command handlers
+            self.application.add_handler(CommandHandler("start", self._start_command))
+            self.application.add_handler(CommandHandler("add", self._add_user_command))
+            self.application.add_handler(CommandHandler("remove", self._remove_user_command))
+            self.application.add_handler(CommandHandler("list", self._list_users_command))
+            self.application.add_handler(CommandHandler("status", self._status_command))
+            
+            logger.info("Bot initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Error during initialization: {e}")
+            raise
     
     async def start(self):
         """Start the bot and monitoring"""
         try:
-            # Start the application
+            # Initialize the application
+            await self.application.initialize()
             await self.application.start()
             
             # Start monitoring task
             self.monitoring_task = asyncio.create_task(self._monitoring_loop())
             
-            # Start polling
             logger.info("Starting Reddit Ban Monitor Bot...")
             
             # Send startup message to Telegram
             await self._send_telegram_message("Reddit Ban Monitor Bot started successfully!")
             
-            await self.application.updater.start_polling()
+            # Start polling in a separate task
+            updater_task = asyncio.create_task(self.application.updater.start_polling(
+                allowed_updates=['message'],
+                drop_pending_updates=True
+            ))
             
-            # Keep the bot running
+            # Wait for shutdown signal
+            await self.shutdown_event.wait()
+            
+            # Cancel updater task
+            updater_task.cancel()
             try:
-                await asyncio.Event().wait()  # Wait indefinitely
+                await updater_task
             except asyncio.CancelledError:
-                logger.info("Bot shutdown requested")
+                pass
                 
         except Exception as e:
             logger.error(f"Error in start: {e}")
@@ -108,6 +119,9 @@ class RedditBanMonitor:
         """Stop the bot and cleanup"""
         logger.info("Stopping bot...")
         
+        # Signal shutdown
+        self.shutdown_event.set()
+        
         if self.monitoring_task and not self.monitoring_task.done():
             self.monitoring_task.cancel()
             try:
@@ -116,11 +130,14 @@ class RedditBanMonitor:
                 pass
         
         if self.application:
-            await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
+            try:
+                await self.application.updater.stop()
+                await self.application.stop()
+                await self.application.shutdown()
+            except Exception as e:
+                logger.error(f"Error stopping application: {e}")
         
-        if self.session:
+        if self.session and not self.session.closed:
             await self.session.close()
         
         logger.info("Bot stopped successfully")
@@ -171,6 +188,15 @@ class RedditBanMonitor:
                 elif response.status == 404:
                     # User not found - could be banned/suspended
                     return False
+                elif response.status == 401:
+                    # Token expired, refresh and retry
+                    await self._get_reddit_token()
+                    headers['Authorization'] = f'Bearer {self.reddit_token}'
+                    async with self.session.get(
+                        f'https://oauth.reddit.com/user/{username}/about',
+                        headers=headers
+                    ) as retry_response:
+                        return retry_response.status == 200
                 else:
                     logger.warning(f"Unexpected status {response.status} for user {username}")
                     return True  # Assume active if unclear
@@ -181,22 +207,17 @@ class RedditBanMonitor:
     async def _send_telegram_message(self, message: str):
         """Send message to Telegram chat"""
         try:
-            url = f'https://api.telegram.org/bot{self.bot_token}/sendMessage'
-            data = {
-                'chat_id': self.chat_id,
-                'text': message,
-                'parse_mode': 'HTML'
-            }
-            
-            async with self.session.post(url, json=data) as response:
-                if response.status != 200:
-                    logger.error(f"Failed to send Telegram message: {response.status}")
+            await self.application.bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode='HTML'
+            )
         except Exception as e:
             logger.error(f"Error sending Telegram message: {e}")
     
     async def _monitoring_loop(self):
         """Main monitoring loop"""
-        while True:
+        while not self.shutdown_event.is_set():
             try:
                 if not self.monitored_users:
                     await asyncio.sleep(60)  # Check every minute if no users
@@ -229,8 +250,12 @@ class RedditBanMonitor:
                     except Exception as e:
                         logger.error(f"Error checking user {username}: {e}")
                 
-                # Wait for next check cycle
-                await asyncio.sleep(self.check_interval * 60)
+                # Wait for next check cycle or shutdown
+                try:
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=self.check_interval * 60)
+                    break  # Shutdown requested
+                except asyncio.TimeoutError:
+                    pass  # Continue with next check
                 
             except asyncio.CancelledError:
                 logger.info("Monitoring loop cancelled")
@@ -345,7 +370,8 @@ async def main():
 def signal_handler(signum, frame):
     """Handle shutdown signals"""
     logger.info(f"Received signal {signum}")
-    sys.exit(0)
+    if bot_instance:
+        asyncio.create_task(bot_instance.stop())
 
 if __name__ == "__main__":
     # Register signal handlers for graceful shutdown
